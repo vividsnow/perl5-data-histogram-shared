@@ -1,5 +1,8 @@
 Revision history for Data-Histogram-Shared
 
+0.03      2026-07-21
+          - Fetch get-magic on optional arguments before testing them.
+
 0.02      2026-07-03
           - Security and robustness hardening; backing files now created mode
             0600 (pass a file-mode argument to new() for cross-user sharing).
