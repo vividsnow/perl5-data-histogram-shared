@@ -9,3 +9,4 @@
 *.bs
 /ppport.h
 *.tar.gz
+/Data-Histogram-Shared-*/

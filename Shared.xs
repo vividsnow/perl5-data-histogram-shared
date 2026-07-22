@@ -18,7 +18,13 @@
  * pins the referent only against refcount-driven destruction, not an
  * explicit DESTROY, so the local `h` would dangle.  Used only where magic
  * can actually intervene between EXTRACT and the first use of h. */
+/* The same Perl that can destroy the handle can also REPLACE the invocant
+ * ($obj = 42 from an overload handler mutates ST(0), because Perl passes
+ * aliases), so SvROK must be re-checked before SvRV -- otherwise SvRV would
+ * run on a non-reference. */
 #define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::Histogram::Shared object was replaced during the call"); \
     h = INT2PTR(HistHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Data::Histogram::Shared object destroyed during the call")
 
@@ -145,6 +151,9 @@ record_many(self, values)
         croak("Data::Histogram::Shared->record_many: expected an array reference");
     av = (AV *)SvRV(values);
     top = av_len(av);                     /* last index, -1 if empty */
+    /* SvGETMAGIC(values) above, and av_len on a tied array (AvFILL -> mg_size
+     * -> FETCHSIZE), both run Perl that can have destroyed self. */
+    REEXTRACT(self);
     {
         STRLEN cnt = (top >= 0) ? (STRLEN)(top + 1) : 0, i;
         int64_t *vals = NULL;
@@ -162,6 +171,10 @@ record_many(self, values)
                 vals[i] = (int64_t)v;
             }
         }
+        /* The REEXTRACT inside the loop above only runs when cnt > 0; a tied
+         * FETCHSIZE reporting 0 skips the loop entirely and lands straight
+         * here, so re-check outside the `if (cnt)` block as well. */
+        REEXTRACT(self);
         hist_rwlock_wrlock(h);                            /* locked region: NO croak-capable calls */
         for (i = 0; i < cnt; i++) hist_record_locked(h, vals[i], 1);
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);  /* a call always counts, even an empty batch */
@@ -276,6 +289,10 @@ merge(self, other)
         croak("Data::Histogram::Shared->merge: expected a Data::Histogram::Shared object");
     HistHandle *o = INT2PTR(HistHandle*, SvIV(SvRV(other)));
     if (!o) croak("Attempted to use a destroyed Data::Histogram::Shared object");
+    /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a tied
+     * `other` can have run Perl that destroyed self before h is used below.
+     * `o` was read after that magic and needs no re-read. */
+    REEXTRACT(self);
 
     /* Geometry is immutable after creation -- compare lock-free, croak BEFORE
      * allocating, so a mismatch holds no lock and leaks no buffer. */
