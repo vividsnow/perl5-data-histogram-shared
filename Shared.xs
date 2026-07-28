@@ -10,6 +10,7 @@
         croak("Expected a Data::Histogram::Shared object"); \
     HistHandle *h = INT2PTR(HistHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::Histogram::Shared object"); \
+    HistHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code (tied/overloaded
@@ -26,7 +27,7 @@
     if (!SvROK(sv)) \
         croak("Data::Histogram::Shared object was replaced during the call"); \
     h = INT2PTR(HistHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::Histogram::Shared object destroyed during the call")
+    if (h != h0) croak("Data::Histogram::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -150,6 +151,7 @@ record_many(self, values)
     if (!SvROK(values) || SvTYPE(SvRV(values)) != SVt_PVAV)
         croak("Data::Histogram::Shared->record_many: expected an array reference");
     av = (AV *)SvRV(values);
+    sv_2mortal(SvREFCNT_inc((SV *)av));   /* pin the arrayref: element magic below cannot free it mid-loop */
     top = av_len(av);                     /* last index, -1 if empty */
     /* SvGETMAGIC(values) above, and av_len on a tied array (AvFILL -> mg_size
      * -> FETCHSIZE), both run Perl that can have destroyed self. */
