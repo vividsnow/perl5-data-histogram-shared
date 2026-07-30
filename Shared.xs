@@ -91,6 +91,27 @@ new_from_fd(class, fd)
   OUTPUT:
     RETVAL
 
+SV *
+new_readonly(class, path)
+    const char *class
+    SV *path
+  PREINIT:
+    char errbuf[HIST_ERR_BUFLEN];
+  CODE:
+    /* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, lock-free.
+       Requires ->freeze on the producer; a non-frozen file is refused. */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (!p) croak("Data::Histogram::Shared->new_readonly: path is required");
+    HistHandle *h = hist_open_readonly(p, errbuf);
+    if (!h) croak("Data::Histogram::Shared->new_readonly: %s", errbuf);
+    /* Re-read the class-name PV immediately before blessing: SvGETMAGIC(path)
+     * above can run arbitrary Perl (tied/overloaded path) that reallocs or
+     * frees ST(0)'s PV, dangling the `class` pointer captured by the typemap. */
+    class = SvPV_nolen(ST(0));
+    MAKE_OBJ(class, h);
+  OUTPUT:
+    RETVAL
+
 void
 DESTROY(self)
     SV *self
@@ -109,6 +130,7 @@ record(self, value, ...)
     int64_t idx;
     IV total;
   CODE:
+    if (h->readonly) croak("Data::Histogram::Shared->record: histogram is frozen (read-only)");
     /* optional count (default 1); read here so an explicit undef falls through to
      * the default instead of warning "uninitialized value". */
     int has_count = (items > 2 && (SvGETMAGIC(ST(2)), SvOK(ST(2))));
@@ -130,6 +152,7 @@ record(self, value, ...)
         croak("Data::Histogram::Shared->record: value %lld exceeds highest_trackable_value (%lld)",
               (long long)value, (long long)h->hdr->highest);
     hist_rwlock_wrlock(h);
+    if (h->hdr->sealed) { hist_rwlock_wrunlock(h); croak("Data::Histogram::Shared->record: histogram is frozen (read-only)"); }
     hist_record_locked(h, (int64_t)value, (int64_t)count);
     total = (IV)h->hdr->total_count;
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -147,6 +170,7 @@ record_many(self, values)
     AV *av;
     IV  top;
   CODE:
+    if (h->readonly) croak("Data::Histogram::Shared->record_many: histogram is frozen (read-only)");
     SvGETMAGIC(values);   /* a tied/overloaded scalar may FETCH to an arrayref */
     if (!SvROK(values) || SvTYPE(SvRV(values)) != SVt_PVAV)
         croak("Data::Histogram::Shared->record_many: expected an array reference");
@@ -178,6 +202,7 @@ record_many(self, values)
          * here, so re-check outside the `if (cnt)` block as well. */
         REEXTRACT(self);
         hist_rwlock_wrlock(h);                            /* locked region: NO croak-capable calls */
+        if (h->hdr->sealed) { hist_rwlock_wrunlock(h); croak("Data::Histogram::Shared->record_many: histogram is frozen (read-only)"); }
         for (i = 0; i < cnt; i++) hist_record_locked(h, vals[i], 1);
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);  /* a call always counts, even an empty batch */
         hist_rwlock_wrunlock(h);
@@ -194,9 +219,13 @@ value_at_percentile(self, p)
     EXTRACT(self);
     IV v;
   CODE:
-    hist_rwlock_rdlock(h);
-    v = (IV)hist_value_at_percentile_locked(h, p);
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable counts, no lock needed */
+        v = (IV)hist_value_at_percentile_locked(h, p);
+    } else {
+        hist_rwlock_rdlock(h);
+        v = (IV)hist_value_at_percentile_locked(h, p);
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = v;
   OUTPUT:
     RETVAL
@@ -216,9 +245,13 @@ count_at_value(self, value)
     if (idx < 0)
         croak("Data::Histogram::Shared->count_at_value: value %lld exceeds highest_trackable_value (%lld)",
               (long long)value, (long long)h->hdr->highest);
-    hist_rwlock_rdlock(h);
-    c = (idx < hist_counts_capacity(h)) ? (IV)hist_counts(h)[idx] : 0;  /* Layer B: reject OOB idx (untrusted geometry) */
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable counts, no lock needed */
+        c = (idx < hist_counts_capacity(h)) ? (IV)hist_counts(h)[idx] : 0;  /* Layer B: reject OOB idx (untrusted geometry) */
+    } else {
+        hist_rwlock_rdlock(h);
+        c = (idx < hist_counts_capacity(h)) ? (IV)hist_counts(h)[idx] : 0;  /* Layer B: reject OOB idx (untrusted geometry) */
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = c;
   OUTPUT:
     RETVAL
@@ -230,10 +263,15 @@ min(self)
     EXTRACT(self);
     int64_t mn, total;
   CODE:
-    hist_rwlock_rdlock(h);
-    total = h->hdr->total_count;
-    mn    = h->hdr->min_value;
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable, no lock needed */
+        total = h->hdr->total_count;
+        mn    = h->hdr->min_value;
+    } else {
+        hist_rwlock_rdlock(h);
+        total = h->hdr->total_count;
+        mn    = h->hdr->min_value;
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = (IV)(total == 0 ? 0 : mn);
   OUTPUT:
     RETVAL
@@ -245,9 +283,13 @@ max(self)
     EXTRACT(self);
     IV mx;
   CODE:
-    hist_rwlock_rdlock(h);
-    mx = (IV)h->hdr->max_value;
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable, no lock needed */
+        mx = (IV)h->hdr->max_value;
+    } else {
+        hist_rwlock_rdlock(h);
+        mx = (IV)h->hdr->max_value;
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = mx;
   OUTPUT:
     RETVAL
@@ -259,9 +301,13 @@ mean(self)
     EXTRACT(self);
     double m;
   CODE:
-    hist_rwlock_rdlock(h);
-    m = hist_mean_locked(h);
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable counts, no lock needed */
+        m = hist_mean_locked(h);
+    } else {
+        hist_rwlock_rdlock(h);
+        m = hist_mean_locked(h);
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = m;
   OUTPUT:
     RETVAL
@@ -273,9 +319,13 @@ total_count(self)
     EXTRACT(self);
     UV t;
   CODE:
-    hist_rwlock_rdlock(h);
-    t = (UV)h->hdr->total_count;
-    hist_rwlock_rdunlock(h);
+    if (h->readonly) {                     /* frozen: immutable, no lock needed */
+        t = (UV)h->hdr->total_count;
+    } else {
+        hist_rwlock_rdlock(h);
+        t = (UV)h->hdr->total_count;
+        hist_rwlock_rdunlock(h);
+    }
     RETVAL = t;
   OUTPUT:
     RETVAL
@@ -287,6 +337,7 @@ merge(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Histogram::Shared->merge: histogram is frozen (read-only)");
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::Histogram::Shared"))
         croak("Data::Histogram::Shared->merge: expected a Data::Histogram::Shared object");
     HistHandle *o = INT2PTR(HistHandle*, SvIV(SvRV(other)));
@@ -326,14 +377,22 @@ merge(self, other)
         int64_t *tmp;
         Newx(tmp, (size_t)(counts_len ? counts_len : 1), int64_t);
         SAVEFREEPV(tmp);                 /* freed on normal return OR croak unwind */
-        hist_rwlock_rdlock(o);
-        if (counts_len > 0) memcpy(tmp, hist_counts(o), (size_t)counts_len * sizeof(int64_t));
-        other_total = o->hdr->total_count;
-        other_min   = o->hdr->min_value;
-        other_max   = o->hdr->max_value;
-        hist_rwlock_rdunlock(o);
+        if (o->readonly) {                     /* frozen other: immutable counts, no lock */
+            if (counts_len > 0) memcpy(tmp, hist_counts(o), (size_t)counts_len * sizeof(int64_t));
+            other_total = o->hdr->total_count;
+            other_min   = o->hdr->min_value;
+            other_max   = o->hdr->max_value;
+        } else {
+            hist_rwlock_rdlock(o);
+            if (counts_len > 0) memcpy(tmp, hist_counts(o), (size_t)counts_len * sizeof(int64_t));
+            other_total = o->hdr->total_count;
+            other_min   = o->hdr->min_value;
+            other_max   = o->hdr->max_value;
+            hist_rwlock_rdunlock(o);
+        }
 
         hist_rwlock_wrlock(h);
+        if (h->hdr->sealed) { hist_rwlock_wrunlock(h); croak("Data::Histogram::Shared->merge: histogram is frozen (read-only)"); }
         if (other_total > 0) hist_merge_counts(hist_counts(h), tmp, counts_len);   /* empty other -> nothing to add */
         if (h->hdr->total_count > INT64_MAX - other_total) h->hdr->total_count = INT64_MAX;
         else h->hdr->total_count += other_total;
@@ -351,10 +410,42 @@ reset(self)
   PREINIT:
     EXTRACT(self);
   CODE:
+    if (h->readonly) croak("Data::Histogram::Shared->reset: histogram is frozen (read-only)");
     hist_rwlock_wrlock(h);
+    if (h->hdr->sealed) { hist_rwlock_wrunlock(h); croak("Data::Histogram::Shared->reset: histogram is frozen (read-only)"); }
     hist_reset_locked(h);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     hist_rwlock_wrunlock(h);
+
+void
+freeze(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    if (h->readonly) croak("Data::Histogram::Shared->freeze: cannot freeze a read-only handle");
+    if (hist_freeze(h) != 0) croak("Data::Histogram::Shared->freeze: msync: %s", strerror(errno));
+    h->readonly = 1;   /* this handle now rejects mutation too (the file is sealed) */
+
+UV
+frozen(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->sealed ? 1 : 0;
+  OUTPUT:
+    RETVAL
+
+UV
+readonly(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->readonly ? 1 : 0;
+  OUTPUT:
+    RETVAL
 
 IV
 lowest(self)
@@ -409,7 +500,7 @@ stats(self)
         double mean;
         /* Snapshot under the lock; do all (croak-capable) Perl allocation after
            releasing it -- so an OOM in newHV/newSV* can never strand the lock. */
-        hist_rwlock_rdlock(h);
+        if (!h->readonly) hist_rwlock_rdlock(h);   /* frozen: immutable, no lock */
         total            = h->hdr->total_count;
         mn               = h->hdr->min_value;
         mx               = h->hdr->max_value;
@@ -421,7 +512,7 @@ stats(self)
         sub_bucket_count = h->hdr->sub_bucket_count;
         ops              = h->hdr->stat_ops;
         mean             = hist_mean_locked(h);
-        hist_rwlock_rdunlock(h);
+        if (!h->readonly) hist_rwlock_rdunlock(h);
 
         HV *hv = newHV();
         hv_stores(hv, "lowest",           newSViv((IV)lowest));
@@ -436,6 +527,8 @@ stats(self)
         hv_stores(hv, "sub_bucket_count", newSViv((IV)sub_bucket_count));
         hv_stores(hv, "ops",              newSVuv((UV)ops));
         hv_stores(hv, "mmap_size",        newSVuv((UV)h->mmap_size));
+        hv_stores(hv, "frozen",           newSVuv(h->hdr->sealed ? 1 : 0));
+        hv_stores(hv, "readonly",         newSVuv(h->readonly ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:
@@ -467,7 +560,7 @@ sync(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    if (hist_msync(h) != 0) croak("sync: %s", strerror(errno));
+    if (!h->readonly && hist_msync(h) != 0) croak("sync: %s", strerror(errno));
 
 void
 unlink(self, ...)

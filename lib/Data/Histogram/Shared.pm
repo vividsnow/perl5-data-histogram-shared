@@ -45,6 +45,11 @@ Data::Histogram::Shared - shared-memory HdrHistogram for Linux
     # share across processes via a backing file
     my $shared = Data::Histogram::Shared->new("/tmp/latency.hdr", 1, 3_600_000_000, 3);
 
+    # freeze and ship: query it read-only (lock-free) on other machines
+    $shared->freeze;
+    my $ro = Data::Histogram::Shared->new_readonly("/tmp/latency.hdr");
+    $ro->value_at_percentile(99);
+
 =head1 DESCRIPTION
 
 A High Dynamic Range histogram (HdrHistogram) in shared memory: a compact,
@@ -89,6 +94,7 @@ the two input streams. B<Linux-only>. Requires 64-bit Perl.
     my $h = Data::Histogram::Shared->new(undef, 1, 3_600_000_000, 3);   # defaults
     my $h = Data::Histogram::Shared->new_memfd($name, $lowest, $highest, $sig_figs);
     my $h = Data::Histogram::Shared->new_from_fd($fd);
+    my $ro = Data::Histogram::Shared->new_readonly($path);   # frozen file, read-only
 
 C<$path> is the backing file (C<undef> or omitted for an anonymous mapping).
 C<$lowest> is the lowest value that can be distinguished from 0 and must be
@@ -118,6 +124,8 @@ C<$highest>. When reopening an existing file or memfd, the B<stored geometry
 wins> and the caller's C<$lowest>/C<$highest>/C<$sig_figs> arguments are
 ignored. C<new_memfd> creates a Linux memfd (transferable via its
 C<memfd> descriptor); C<new_from_fd> reopens one in another process.
+C<new_readonly> opens a B<frozen> file read-only for lock-free querying (see
+L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Recording values
 
@@ -229,6 +237,11 @@ C<record_many>, C<merge>, C<reset>).
 
 =item * C<mmap_size> -- bytes of the shared mapping.
 
+=item * C<frozen> -- 1 if the histogram has been sealed by C<freeze> (immutable), else 0.
+
+=item * C<readonly> -- 1 if this handle is a read-only view (from C<new_readonly>,
+or the handle that called C<freeze>), else 0.
+
 =back
 
 =head1 SHARING ACROSS PROCESSES
@@ -247,6 +260,44 @@ combined stream all of them have recorded.
     unless (fork) { $h->record(500) for 1 .. 10; exit }
     wait;
     print $h->value_at_percentile(50), "\n";   # the child's recordings
+
+=head1 FROZEN (READ-ONLY) MODE
+
+A file-backed histogram can be B<frozen> and then shipped to other machines,
+where consumers open it B<read-only> and query it with B<no locking at all>.
+
+    # producer: build, freeze, ship the file
+    my $h = Data::Histogram::Shared->new("/tmp/latency.hdr", 1, 3_600_000_000, 3);
+    $h->record_many(\@samples);
+    $h->freeze;                  # seal: now immutable, and $h itself is read-only
+    # ... copy /tmp/latency.hdr to another host ...
+
+    # consumer (any process, same architecture): read-only, lock-free
+    my $ro = Data::Histogram::Shared->new_readonly("/tmp/latency.hdr");
+    $ro->value_at_percentile(99) for @queries;
+
+C<freeze> takes the write lock, marks the histogram B<permanently immutable>
+(there is no unfreeze -- rebuild the file to change it), and flushes the seal to
+disk. A frozen histogram rejects every mutator (C<record>, C<record_many>,
+C<merge>, C<reset>) with a croak, and a read-write reopen (C<< new($path, ...) >>)
+of a sealed file is B<refused> -- so a shipped artifact can never be silently
+mutated out from under its readers.
+
+C<new_readonly($path)> maps the file C<O_RDONLY> / C<PROT_READ> and B<requires it
+to be frozen> (it croaks on a file that was never C<freeze>d). Because a sealed
+histogram's counts and geometry are immutable, C<value_at_percentile>,
+C<percentile>, C<count_at_value>, C<min>, C<max>, C<mean>, C<total_count>,
+C<count> and C<stats> read them B<directly, taking no reader lock> -- the mapping
+is never written, so a read-only view works from a read-only file descriptor or a
+read-only filesystem, and any number of processes can share one C<PROT_READ>
+mapping. C<frozen> and C<readonly> report the two states.
+
+B<Portability.> The on-disk format is native binary (native-endian 64-bit
+words), so a frozen file may be copied only between machines of the B<same
+architecture>; a wrong-endian file is rejected at open by the magic check.
+B<Copy the file to each consumer> -- do not share one file over a network
+filesystem: the lock is a Linux futex (process-local to one kernel), and the
+"no live writer" contract assumes a static copy. Linux-only; 64-bit Perl.
 
 =head1 SECURITY
 

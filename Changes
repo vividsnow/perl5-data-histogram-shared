@@ -1,6 +1,9 @@
 Revision history for Data-Histogram-Shared
 
 0.03      2026-07-22
+          - Add a frozen read-only mode: freeze() seals a file-backed histogram
+            immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
+            it lock-free.
           - Fix use-after-free in merge() and record_many(): a tied argument,
             a tied array, or overloaded elements run Perl that can destroy
             the histogram, after which the already-captured handle was still
