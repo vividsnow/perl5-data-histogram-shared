@@ -55,7 +55,7 @@ new(class, path = &PL_sv_undef, lowest = 1, highest = 3600000000LL, sig_figs = 3
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     HistHandle *h = hist_create(p, (int64_t)lowest, (int64_t)highest,
                                 (int32_t)sig_figs, mode, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::Histogram::Shared->new: %s", errbuf);
+    if (!h) croak("Data::Histogram::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -73,7 +73,7 @@ new_memfd(class, name = &PL_sv_undef, lowest = 1, highest = 3600000000LL, sig_fi
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;   /* undef -> default label */
     HistHandle *h = hist_create_memfd(nm, (int64_t)lowest, (int64_t)highest,
                                       (int32_t)sig_figs, errbuf);   /* validates args into errbuf */
-    if (!h) croak("Data::Histogram::Shared->new_memfd: %s", errbuf);
+    if (!h) croak("Data::Histogram::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
@@ -86,7 +86,7 @@ new_from_fd(class, fd)
     char errbuf[HIST_ERR_BUFLEN];
   CODE:
     HistHandle *h = hist_open_fd(fd, errbuf);
-    if (!h) croak("Data::Histogram::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::Histogram::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL
