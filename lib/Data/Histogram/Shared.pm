@@ -1,7 +1,7 @@
 package Data::Histogram::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 require XSLoader;
 XSLoader::load('Data::Histogram::Shared', $VERSION);
 
@@ -105,11 +105,12 @@ and must be in the range 1..5 (default 3). C<new> and C<new_memfd> croak if any
 argument is out of range.
 
 C<$mode> sets the permission bits used when C<new> B<creates> the backing file
-(applied exactly via C<fchmod>, so umask does not narrow it); the default is C<0600>, owner-only. Pass
-e.g. C<0660> to opt in to sharing the file with other users in the group. It
-applies only at creation: reopening an existing file does not change its
-permissions, and the argument is ignored for anonymous histograms (C<$path>
-undef or omitted). C<new_memfd> and C<new_from_fd> do not take a mode.
+(applied exactly via C<fchmod>, so umask does not narrow it); the default is
+C<0600>, owner-only. Pass e.g. C<0660> to opt in to sharing the file with
+other users in the group. It applies only at creation: reopening an existing
+file does not change its permissions, and the argument is ignored for
+anonymous histograms (C<$path> undef or omitted). C<new_memfd> and
+C<new_from_fd> do not take a mode.
 
 C<$lowest> additionally must satisfy
 C<floor(log2($lowest)) + ceil(log2(2 * 10**$sig_figs)) - 1 E<lt>= 61> (a
@@ -122,10 +123,11 @@ C<floor(log2($lowest))>, C<2 * 10**sig_figs> sub-buckets per power of two
 (rounded up to a power of two), and as many buckets as are needed to cover
 C<$highest>. When reopening an existing file or memfd, the B<stored geometry
 wins> and the caller's C<$lowest>/C<$highest>/C<$sig_figs> arguments are
-ignored. C<new_memfd> creates a Linux memfd (transferable via its
-C<memfd> descriptor); C<new_from_fd> reopens one in another process.
-C<new_readonly> opens a B<frozen> file read-only for lock-free querying (see
-L</"FROZEN (READ-ONLY) MODE">).
+ignored. C<new_memfd> creates a Linux memfd (transferable via its C<memfd>
+descriptor); C<new_from_fd> reopens one in another process. The descriptor you
+pass is duplicated (C<F_DUPFD_CLOEXEC>), so it stays yours to close and
+closing it does not disturb the handle. C<new_readonly> opens a B<frozen> file
+read-only for lock-free querying (see L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Recording values
 
@@ -301,14 +303,16 @@ filesystem: the lock is a Linux futex (process-local to one kernel), and the
 
 =head1 SECURITY
 
-Backing files are created with mode C<0600> (owner-only) by default, so only the
-creating user can open and attach them. To share a backing file across users,
-pass an explicit octal file mode such as C<0660> as the last argument to C<new>; the mode is applied
-only when the file is created (an existing file keeps its own permissions). The
-file is opened with C<O_NOFOLLOW>, so a symlink planted at the path is refused,
-and created with C<O_EXCL>; the on-disk header is validated when the file is
-attached. Any process you grant write access to a shared mapping is trusted not
-to corrupt its contents while other processes are using it.
+Backing files are created with mode C<0600> (owner-only) by default, so only
+the creating user can open and attach them. To share a backing file across
+users, pass an explicit octal file mode such as C<0660> as the last argument
+to C<new>; the mode is applied when the file is created, and when a file left
+behind by an interrupted create is re-initialized (see L</CRASH SAFETY>); a
+file already in use keeps its own permissions. The file is opened with
+C<O_NOFOLLOW>, so a symlink planted at the path is refused, and created with
+C<O_EXCL>; the on-disk header is validated when the file is attached. Any
+process you grant write access to a shared mapping is trusted not to corrupt
+its contents while other processes are using it.
 
 =head1 CRASH SAFETY
 
@@ -329,6 +333,18 @@ reclaim it and writers may block until the mapping is recreated. Reaching this
 needs more than 1024 concurrent reader processes on one mapping plus a crash in
 the brief read-lock window; the dead-process slot reclaim keeps the table from
 filling with stale entries, so in practice it is very unlikely.
+
+An interrupted create is recovered too. A creator killed after the backing
+file is sized but before its header is committed leaves a full-size, all-zero
+file. C<new> re-initializes such a file automatically, but only when it is
+exactly the size the requested geometry needs, is owned by your effective uid,
+and is still entirely zero -- a file holding data is never re-initialized. If
+the creator got as far as writing part of the header, the file cannot be told
+apart from a corrupt one and C<new> croaks with C<incomplete histogram file
+left by an interrupted create; remove it and retry>. A file left behind by an
+interrupted create never held data, so removing it is safe -- but a file whose
+header was corrupted after the fact reaches the same croak, so confirm it is
+an abandoned create before deleting anything you care about.
 
 =head1 SEE ALSO
 

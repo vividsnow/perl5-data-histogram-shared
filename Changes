@@ -1,9 +1,17 @@
 Revision history for Data-Histogram-Shared
 
-0.03      2026-07-22
+0.04      2026-08-05
+          - xt/valgrind.t: run the real interpreter, not a wrapper script. Under
+            a shim perl (plenv, perlbrew) valgrind traced the shell and never saw
+            the XS, so the test passed regardless of what the module did.
+          - An interrupted create no longer leaves a file that can never be opened
+            again: such a file is re-initialized when it is provably empty and owned
+            by us, and is otherwise reported as incomplete rather than just invalid.
           - Add a frozen read-only mode: freeze() seals a file-backed histogram
             immutable; new_readonly() opens it O_RDONLY / PROT_READ and queries
             it lock-free.
+
+0.03      2026-07-22
           - Fix use-after-free in merge() and record_many(): a tied argument,
             a tied array, or overloaded elements run Perl that can destroy
             the histogram, after which the already-captured handle was still
